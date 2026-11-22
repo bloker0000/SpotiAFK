@@ -1,4 +1,4 @@
-"""Legacy entry point kept for compatibility: same as 'spotiafk run'."""
+"""spotiafk 1 started with python3 spotiAFK.py, that still works"""
 
 import sys
 

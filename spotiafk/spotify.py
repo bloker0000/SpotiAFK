@@ -1,87 +1,126 @@
-"""Spotify API access: authentication and the queries spotiAFK needs.
-
-Transient failures (network errors, 429 rate limits, 5xx) are handled by
-spotipy's built-in urllib3 retry with backoff, configured on the client;
-anything that still escapes is handled by the run loop's error handler.
-"""
-
 import glob
 import logging
 import os
 import random
+import re
 import shutil
-import stat
-import time
+from http import HTTPStatus
 
+import requests
 import spotipy
+import urllib3
+from requests.adapters import HTTPAdapter
 from spotipy.oauth2 import SpotifyOAuth
 
-from spotiafk.config import BASE_DIR, MS_PER_SECOND, SCOPE, Config
+from spotiafk.config import BASE_DIR, PRIVATE_FILE_MODE, SCOPE, Config
+from spotiafk.units import MS_PER_SECOND
+
+# without "episode" a playing podcast comes back with no item
+PLAYBACK_TYPES = "track,episode"
+SPOTIFY_LINK = re.compile(r"open\.spotify\.com/(?:intl-[\w-]+/)?(\w+)/(\w+)")
+DJ_URI = "spotify:playlist:37i9dQZF1EYkqdzj48dyYq"
+REQUEST_TIMEOUT_SECONDS = 15
+REQUEST_RETRIES = 5
+RETRIED_STATUSES = (
+    HTTPStatus.INTERNAL_SERVER_ERROR,
+    HTTPStatus.BAD_GATEWAY,
+    HTTPStatus.SERVICE_UNAVAILABLE,
+    HTTPStatus.GATEWAY_TIMEOUT,
+)
 
 logger = logging.getLogger(__name__)
 
 
-def token_cache_path(cfg: Config) -> str:
-    return os.path.join(cfg.state_dir, "token.dat")
+def parse_context_uri(text: str) -> str | None:
+    # None when the config names one of your playlists
+    if text.startswith("spotify:"):
+        return text
+    match = SPOTIFY_LINK.search(text)
+    return f"spotify:{match[1]}:{match[2]}" if match else None
 
 
-def _migrate_legacy_token(cfg: Config) -> None:
-    cache = token_cache_path(cfg)
+def get_token_cache_path(config: Config) -> str:
+    return os.path.join(config.state_dir, "token.dat")
+
+
+def _migrate_legacy_token(config: Config) -> None:
+    cache = get_token_cache_path(config)
     if os.path.isfile(cache):
         return
-    legacy = sorted(glob.glob(os.path.join(BASE_DIR, "token-*.dat")))
-    if legacy:
-        os.makedirs(cfg.state_dir, exist_ok=True)
-        shutil.copy(legacy[0], cache)
-        logger.info("Migrated legacy token cache into %s", cfg.state_dir)
+    legacy_tokens = sorted(glob.glob(os.path.join(BASE_DIR, "token-*.dat")))
+    if legacy_tokens:
+        os.makedirs(config.state_dir, exist_ok=True)
+        shutil.copy(legacy_tokens[0], cache)
+        logger.info("Migrated legacy token cache into %s", config.state_dir)
 
 
-def make_client(cfg: Config) -> spotipy.Spotify:
-    _migrate_legacy_token(cfg)
-    os.makedirs(cfg.state_dir, exist_ok=True)
+def _build_session() -> requests.Session:
+    retry = urllib3.Retry(
+        total=REQUEST_RETRIES,
+        connect=None,
+        read=False,
+        status=REQUEST_RETRIES,
+        allowed_methods=frozenset(["GET", "POST", "PUT", "DELETE"]),
+        backoff_factor=1,
+        status_forcelist=RETRIED_STATUSES,
+        # a 429 can ask for hours, the run loop waits instead
+        respect_retry_after_header=False,
+    )
+    adapter = HTTPAdapter(max_retries=retry)
+    session = requests.Session()
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+    return session
+
+
+def make_client(config: Config) -> spotipy.Spotify:
+    _migrate_legacy_token(config)
+    os.makedirs(config.state_dir, exist_ok=True)
     auth_manager = SpotifyOAuth(
-        client_id=cfg.client_id,
-        client_secret=cfg.client_secret,
-        redirect_uri=cfg.redirect_uri,
+        client_id=config.client_id,
+        client_secret=config.client_secret,
+        redirect_uri=config.redirect_uri,
         scope=SCOPE,
-        cache_path=token_cache_path(cfg),
-        open_browser=False,
+        cache_path=get_token_cache_path(config),
+        # with a browser, spotipy catches the login redirect on 127.0.0.1 itself
+        open_browser=True,
     )
     client = spotipy.Spotify(
         auth_manager=auth_manager,
-        requests_timeout=15,
-        retries=5,
-        status_retries=5,
-        backoff_factor=1,  # urllib3 backoff; also honors Retry-After on 429
+        requests_session=_build_session(),
+        requests_timeout=REQUEST_TIMEOUT_SECONDS,
     )
     client.current_user()
-    if os.path.isfile(token_cache_path(cfg)):
-        os.chmod(token_cache_path(cfg), stat.S_IRUSR | stat.S_IWUSR)
+    if os.path.isfile(get_token_cache_path(config)):
+        os.chmod(get_token_cache_path(config), PRIVATE_FILE_MODE)
     logger.info("Authenticated with Spotify")
     return client
 
 
-def account_is_free(client: spotipy.Spotify, cfg: Config) -> bool:
-    """True when nobody is listening, or playback is already on one of our devices."""
-    playing = client.current_user_playing_track()
-    if not playing or not playing.get("is_playing"):
-        return True
-    active = [d for d in client.devices()["devices"] if d.get("is_active")]
-    if not active:
-        return True
-    return all(d["name"] in cfg.play_on for d in active)
+def read_retry_after_seconds(error: spotipy.SpotifyException) -> float:
+    try:
+        return float((error.headers or {}).get("Retry-After", 0))
+    except (TypeError, ValueError):
+        return 0.0
 
 
-def get_server_ids(client: spotipy.Spotify, cfg: Config) -> list:
-    """Ids of the configured devices, waiting until at least one is online."""
-    while True:
-        servers = [d for d in client.devices()["devices"] if d["name"] in cfg.play_on]
-        if servers:
-            for device in servers:
-                logger.info("Device named %s found", device["name"])
-            return [d["id"] for d in servers]
-        logger.info("None of %s are online, retrying in %ss", list(cfg.play_on), cfg.retry_time)
-        time.sleep(cfg.retry_time)
+def fetch_playback(client: spotipy.Spotify) -> dict | None:
+    # None when nothing plays anywhere on the account
+    return client.current_playback(additional_types=PLAYBACK_TYPES)
+
+
+def list_playlists(client: spotipy.Spotify, limit: int) -> list:
+    # [name, uri, whether you made it]
+    user_id = client.current_user()["id"]
+    playlists = []
+    page = client.current_user_playlists()
+    while page and len(playlists) < limit:
+        for playlist in page["items"]:
+            if playlist:
+                owner_id = (playlist.get("owner") or {}).get("id")
+                playlists.append([playlist["name"], playlist["uri"], owner_id == user_id])
+        page = client.next(page) if page["next"] else None
+    return playlists[:limit]
 
 
 def find_playlist_id(client: spotipy.Spotify, name: str) -> str | None:
@@ -94,26 +133,37 @@ def find_playlist_id(client: spotipy.Spotify, name: str) -> str | None:
     return None
 
 
-def get_tracks(client: spotipy.Spotify, cfg: Config) -> list:
-    """Return [uri, duration_seconds, name] for every playable track in the playlist."""
-    playlist_id = find_playlist_id(client, cfg.playlist)
+def can_read_playlist(client: spotipy.Spotify, playlist_id: str) -> bool:
+    # dev mode apps only get your own playlists, the rest 403
+    try:
+        client.playlist_items(playlist_id, limit=1)
+    except spotipy.SpotifyException as error:
+        if error.http_status == HTTPStatus.FORBIDDEN:
+            return False
+        raise
+    return True
+
+
+def load_playlist(client: spotipy.Spotify, config: Config) -> tuple[str, list]:
+    # [uri, duration in seconds, name] per playable track
+    playlist_id = find_playlist_id(client, config.playlist)
     if playlist_id is None:
-        raise RuntimeError(f"Playlist {cfg.playlist!r} was not found on this account")
+        raise RuntimeError(f"Playlist {config.playlist!r} was not found on this account")
 
     tracks_to_play = []
     page = client.playlist_items(playlist_id)
     while page:
         for entry in page["items"]:
-            # the API renamed the entry key from "track" to "item"; accept both
+            # the api renamed track to item, old answers still say track
             track = entry.get("item") or entry.get("track")
             if not track or not track.get("uri") or track.get("duration_ms") is None:
-                continue  # removed/unavailable tracks and episodes
-            tracks_to_play.append(
-                [track["uri"], track["duration_ms"] / MS_PER_SECOND, track["name"]]
-            )
+                continue  # removed or unavailable
+            if track.get("is_local"):
+                continue  # local files cant be started remotely
+            tracks_to_play.append([track["uri"], track["duration_ms"] / MS_PER_SECOND, track["name"]])
         page = client.next(page) if page["next"] else None
 
-    if cfg.shuffle:
+    if config.shuffle:
         random.shuffle(tracks_to_play)
     logger.info("Updated playlist (%d tracks)", len(tracks_to_play))
-    return tracks_to_play
+    return playlist_id, tracks_to_play

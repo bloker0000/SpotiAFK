@@ -4,10 +4,17 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "spotiafk"
-version = "2.0.0"
-description = "Plays a Spotify playlist on your devices while you're away"
+dynamic = ["version"]
+description = "Plays Spotify on a spare device while you're away, and hands it back when you're not"
+readme = "readme.md"
+license = { file = "LICENSE" }
+authors = [{ name = "Staninna" }]
 requires-python = ">=3.11"
-dependencies = ["spotipy~=2.24", "telegram-send"]
+dependencies = ["spotipy~=2.26", "requests>=2.25", "urllib3>=1.26"]
+
+[project.urls]
+Source = "https://github.com/bloker0000/SpotiAFK"
+Original = "https://github.com/Staninna/SpotiAFK"
 
 [project.scripts]
 spotiafk = "spotiafk.cli:main"
@@ -15,22 +22,9 @@ spotiafk = "spotiafk.cli:main"
 [tool.setuptools]
 packages = ["spotiafk"]
 
-[tool.ruff]
-line-length = 100
-target-version = "py312"
-
-[tool.ruff.lint]
-select = [
-    "E",   # pycodestyle errors
-    "F",   # pyflakes
-    "I",   # import sorting
-    "UP",  # pyupgrade
-    "B",   # bugbear
-    "SIM", # simplifications
-]
-
-[tool.ruff.lint.isort]
-known-first-party = ["spotiafk"]
+[tool.setuptools.dynamic]
+# spotiafk.__init__, not spotiafk: on windows and macos file names ignore case, so setuptools finds spotiAFK.py first
+version = { attr = "spotiafk.__init__.__version__" }
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

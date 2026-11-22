@@ -1,17 +1,23 @@
-# Credentials & tokens — never commit these
+# credentials and tokens, never commit these
 spotiafk.toml
 options.py
-telegram.conf
 token-*.dat
 .cache*
 
-# Runtime output
+# the windows web player profile holds your spotify login
+device/
+
+# runtime output
 logs/
 time.txt
 
-# Python
+# python
 __pycache__/
 *.pyc
 *.egg-info/
+build/
+dist/
 .venv/
 venv/
+.pytest_cache/
+.ruff_cache/

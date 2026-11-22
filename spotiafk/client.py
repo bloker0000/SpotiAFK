@@ -1,88 +1,133 @@
-"""The public Python API: Config.load() + Client(run/status/stats)."""
-
+import contextlib
 import datetime
+import glob
 import logging
 import os
 import signal
 import sys
 import time
+from http import HTTPStatus
 
+import requests
 import spotipy
 
 from spotiafk import stats, statusfile
-from spotiafk.config import MAX_BACKOFF, Config
-from spotiafk.notifications import notify
+from spotiafk.config import MAX_BACKOFF_SECONDS, Config
 from spotiafk.session import Session
-from spotiafk.spotify import make_client
+from spotiafk.spotify import get_token_cache_path, make_client, read_retry_after_seconds
+from spotiafk.units import SECONDS_PER_DAY
+
+# past this, status calls the run loop dead
+MISSED_CHECKS_BEFORE_STALE = 3
+MIN_STALE_SECONDS = 90
+# spotify sometimes asks for hours, past this it just retries
+MAX_RATE_LIMIT_WAIT_SECONDS = 3600
+LOG_RETENTION_DAYS = 30
 
 logger = logging.getLogger(__name__)
 
-START_PROGRAM_MESSAGE = "Starting program 🏁"
+
+def _prune_logs(logs_dir: str) -> None:
+    oldest_kept = time.time() - LOG_RETENTION_DAYS * SECONDS_PER_DAY
+    for path in glob.glob(os.path.join(logs_dir, "*.log")):
+        # windows cant delete a log another run still has open
+        with contextlib.suppress(OSError):
+            if os.path.getmtime(path) < oldest_kept:
+                os.remove(path)
 
 
-def setup_logging(cfg: Config) -> None:
-    logs_dir = os.path.join(cfg.state_dir, "logs")
+def setup_logging(config: Config) -> None:
+    logs_dir = os.path.join(config.state_dir, "logs")
     os.makedirs(logs_dir, exist_ok=True)
+    _prune_logs(logs_dir)
     stamp = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    logfile = os.path.join(logs_dir, f"{stamp}_{os.getpid()}.log")
+    log_path = os.path.join(logs_dir, f"{stamp}_{os.getpid()}.log")
+    handlers = [logging.FileHandler(log_path, encoding="utf-8")]
+    if sys.stdout is not None:  # None under pythonw
+        handlers.append(logging.StreamHandler(sys.stdout))
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s: %(message)s",
         datefmt="%d/%m/%Y %H:%M:%S",
-        handlers=[logging.FileHandler(logfile), logging.StreamHandler(sys.stdout)],
+        handlers=handlers,
     )
 
 
 class Client:
-    """Everything a caller can do with spotiAFK: run it, ask its status and stats."""
-
     def __init__(self, config: Config | None = None) -> None:
-        self.cfg = config if config is not None else Config.load()
+        self.config = config if config is not None else Config.load()
 
     def run(self) -> None:
-        """Validate, authenticate, and farm until interrupted. Blocking."""
-        self.cfg.require_valid()
-        stats.import_legacy(self.cfg.state_dir)
+        """blocks until ctrl-c or a stop signal"""
+        self.config.require_valid()
+        stats.import_legacy(self.config.state_dir)
+        stats.upgrade_events(self.config.state_dir)
         logger.info("Started the program")
-        notify(self.cfg, "INFO", START_PROGRAM_MESSAGE)
-
-        session = Session(make_client(self.cfg), self.cfg)
         signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
-
-        retries = 0
         try:
-            while True:
-                try:
-                    session.tick()
-                    retries = 0
-                except (KeyboardInterrupt, SystemExit):
-                    session.stop_playing()
-                    logger.info("Shutting down")
-                    raise
-                except Exception as error:
-                    retries += 1
-                    is_auth_error = (
-                        isinstance(error, spotipy.SpotifyException) and error.http_status == 401
-                    )
-                    logger.exception("%s: %s", type(error).__name__, error)
-                    telegram = self.cfg.telegram
-                    if telegram and telegram.notify_on_error and not is_auth_error:
-                        notify(self.cfg, "ERROR", f"{type(error).__name__}: {error} ⚠️⚠️⚠️")
-                    statusfile.write(self.cfg.state_dir, "retrying", error=str(error))
-                    time.sleep(min(self.cfg.retry_time * 2 ** (retries - 1), MAX_BACKOFF))
+            session = Session(self._connect(), self.config)
+            # so status sees it alive before the first check
+            statusfile.write(self.config.state_dir, "watching", checks=f"0/{self.config.idle_checks}")
+            self._loop(session)
         finally:
-            statusfile.write(self.cfg.state_dir, "stopped")
+            statusfile.write(self.config.state_dir, "stopped")
 
-    def status(self) -> dict:
-        """The last heartbeat the run loop wrote, plus whether it looks live."""
-        status = statusfile.read(self.cfg.state_dir)
+    def _connect(self) -> spotipy.Spotify:
+        attempts = 0
+        while True:
+            if not os.path.isfile(get_token_cache_path(self.config)):
+                # spotipy opens a login tab and waits, the watcher tells you
+                statusfile.write(self.config.state_dir, "logging in")
+            try:
+                return make_client(self.config)
+            except spotipy.oauth2.SpotifyOauthError as error:
+                if getattr(error, "error", None) != "invalid_grant":
+                    raise
+                # the saved login is dead for good, so ask for a new one
+                logger.warning("Spotify no longer accepts the saved login, asking you to log in again")
+                with contextlib.suppress(FileNotFoundError):
+                    os.remove(get_token_cache_path(self.config))
+            except (requests.exceptions.RequestException, spotipy.SpotifyException) as error:
+                attempts += 1
+                logger.warning("Can't reach Spotify yet: %s", error)
+                self._wait_before_retry(error, attempts)
+
+    def _loop(self, session: Session) -> None:
+        retries = 0
+        while True:
+            try:
+                session.tick()
+                retries = 0
+            except (KeyboardInterrupt, SystemExit):
+                session.stop()
+                logger.info("Shutting down")
+                raise
+            except Exception as error:
+                retries += 1
+                logger.exception("%s: %s", type(error).__name__, error)
+                self._wait_before_retry(error, retries)
+
+    def _wait_before_retry(self, error: Exception, attempt: int) -> None:
+        delay_seconds = min(self.config.retry_delay_seconds * 2 ** (attempt - 1), MAX_BACKOFF_SECONDS)
+        if isinstance(error, spotipy.SpotifyException) and error.http_status == HTTPStatus.TOO_MANY_REQUESTS:
+            asked_seconds = min(read_retry_after_seconds(error), MAX_RATE_LIMIT_WAIT_SECONDS)
+            delay_seconds = max(delay_seconds, asked_seconds)
+        logger.info("Trying again in %ds", delay_seconds)
+        statusfile.write(self.config.state_dir, "retrying", error=str(error), retry_in_seconds=round(delay_seconds))
+        time.sleep(delay_seconds)
+
+    def read_status(self) -> dict:
+        status = statusfile.read(self.config.state_dir)
         if status is None:
             return {"state": "not running", "live": False}
-        age = statusfile.age_seconds(status)
-        stale_after = max(3 * self.cfg.check_interval, 90)
-        live = status.get("state") not in ("stopped",) and age is not None and age < stale_after
-        return {**status, "live": live, "age_seconds": None if age is None else round(age)}
+        age = statusfile.measure_age_seconds(status)
+        stale_after = max(MISSED_CHECKS_BEFORE_STALE * self.config.check_interval_seconds, MIN_STALE_SECONDS)
+        # a retry can sleep longer than a check
+        stale_after = max(stale_after, status.get("retry_in_seconds", 0) + MIN_STALE_SECONDS)
+        is_live = status.get("state") not in ("stopped",) and age is not None and age < stale_after
+        return {**status, "live": is_live, "age_seconds": None if age is None else round(age)}
 
-    def stats(self, since: datetime.datetime | None = None) -> stats.Stats:
-        stats.import_legacy(self.cfg.state_dir)
-        return stats.summary(self.cfg.state_dir, since=since)
+    def read_stats(self, since: datetime.datetime | None = None) -> stats.Stats:
+        stats.import_legacy(self.config.state_dir)
+        stats.upgrade_events(self.config.state_dir)
+        return stats.summarize(self.config.state_dir, since=since)
