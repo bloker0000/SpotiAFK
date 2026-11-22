@@ -3,7 +3,7 @@
   <p>Plays Spotify on a spare device while you're away, and hands it back the moment you're not.</p>
   <p><sub>Based on <a href="https://github.com/Staninna/SpotiAFK">SpotiAFK</a> by <a href="https://github.com/Staninna">Staninna</a>, changed in November 2026 (<a href="#upgrading">what changed</a>).</sub></p>
   <p>
-    <img alt="version" src="https://img.shields.io/badge/version-v3.0.0-e8590c">
+    <a href="https://github.com/bloker0000/SpotiAFK/releases/latest"><img alt="version" src="https://img.shields.io/badge/version-v3.0.0-e8590c"></a>
     <a href="https://github.com/bloker0000/SpotiAFK/commits/master"><img alt="updated" src="https://img.shields.io/github/last-commit/bloker0000/SpotiAFK?label=updated&color=2ea043"></a>
     <a href="https://github.com/bloker0000/SpotiAFK/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/bloker0000/SpotiAFK/actions/workflows/ci.yml/badge.svg"></a>
     <a href="LICENSE"><img alt="license" src="https://img.shields.io/badge/license-GPL--3.0-3d6fb6"></a>
