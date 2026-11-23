@@ -71,6 +71,8 @@ def print_status(arguments) -> int:
             line += f", track: {status['track']}"
         if status.get("checks"):
             line += f", idle checks: {status['checks']}"
+        if status.get("error"):
+            line += f", {status['error']}"
         print(line + f" (heartbeat {status['age_seconds']}s ago, pid {status.get('pid')})")
     return ExitCode.OK if status["live"] else ExitCode.NOT_RUNNING
 

@@ -11,10 +11,11 @@ from spotiafk import stats, statusfile
 from spotiafk.config import Config
 from spotiafk.spotify import fetch_playback, load_playlist, parse_context_uri
 
-# one api call each, only while it plays
-PLAYING_CHECK_INTERVAL_SECONDS = 1
+# spotify cut the app off after about 25k requests in a day, every 5 seconds stays under that playing all day
+PLAYING_CHECK_INTERVAL_SECONDS = 5
 # one paused poll can just be the device loading the next track
 PAUSED_POLLS_FOR_TAKEOVER = 2
+PAUSE_CONFIRM_SECONDS = 1
 # spotify can report the old state right after a start
 LOAD_GRACE_SECONDS = 5.0
 # keep under MIN_STALE_SECONDS in client.py
@@ -152,9 +153,8 @@ class Session:
                 remaining = math.inf if deadline is None else deadline - time.time()
                 if remaining <= 0 and not paused_polls:
                     return None
-                # a pause near the end still gets its second look
-                sleep_seconds = min(PLAYING_CHECK_INTERVAL_SECONDS, remaining)
-                time.sleep(PLAYING_CHECK_INTERVAL_SECONDS if remaining <= 0 else sleep_seconds)
+                # a pause gets its second look right away, also when the track is already over
+                time.sleep(PAUSE_CONFIRM_SECONDS if paused_polls else min(PLAYING_CHECK_INTERVAL_SECONDS, remaining))
                 current = fetch_playback(self.client)
                 reason = self.find_takeover_reason(current)
                 if time.time() - self.started_at < LOAD_GRACE_SECONDS:

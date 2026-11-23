@@ -36,7 +36,7 @@ SpotiAFK watches your Spotify account. When nothing has played for 15 minutes, i
 
 ## How it works
 
-Every 30 seconds it checks what your account is playing. After 15 minutes of nothing (`idle_minutes`), it plays on a `play_on` device. While it plays, it checks every second whether you took over:
+Every 30 seconds it checks what your account is playing. After 15 minutes of nothing (`idle_minutes`), it plays on a `play_on` device. While it plays, it checks every 5 seconds whether you took over:
 
 | You do this while it plays       | It does this                                                    |
 | -------------------------------- | --------------------------------------------------------------- |

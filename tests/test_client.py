@@ -125,3 +125,8 @@ def test_logs_older_than_a_month_are_removed(tmp_path):
     _prune_logs(str(tmp_path))
     assert not old_log.exists()
     assert new_log.exists()
+
+
+def test_a_rate_limit_says_how_long_spotify_blocks_it(client):
+    client._wait_before_retry(rate_limited("36017"), 1)
+    assert statusfile.read(client.config.state_dir)["error"] == "too many requests, blocked for about 10 hours"

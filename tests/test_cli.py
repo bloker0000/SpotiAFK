@@ -127,3 +127,10 @@ def test_setup_offers_dj_and_saves_followed_playlists_as_links(monkeypatch, caps
     monkeypatch.setattr("builtins.input", lambda prompt: answer)
     assert _pick_what_to_play(FakeLibrary()) == chosen
     assert "lofi (followed)" in capsys.readouterr().out
+
+
+def test_status_says_why_it_is_retrying(tmp_path, capsys):
+    config = write_config(tmp_path)
+    statusfile.write(str(tmp_path / "state"), "retrying", error="too many requests, blocked for about 10 hours")
+    main(["--config", config, "status"])
+    assert capsys.readouterr().out.startswith("Running: retrying, too many requests, blocked for about 10 hours")

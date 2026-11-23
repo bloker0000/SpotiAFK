@@ -15,7 +15,7 @@ from spotiafk import stats, statusfile
 from spotiafk.config import MAX_BACKOFF_SECONDS, Config
 from spotiafk.session import Session
 from spotiafk.spotify import get_token_cache_path, make_client, read_retry_after_seconds
-from spotiafk.units import SECONDS_PER_DAY
+from spotiafk.units import SECONDS_PER_DAY, SECONDS_PER_HOUR, SECONDS_PER_MINUTE
 
 # past this, status calls the run loop dead
 MISSED_CHECKS_BEFORE_STALE = 3
@@ -25,6 +25,12 @@ MAX_RATE_LIMIT_WAIT_SECONDS = 3600
 LOG_RETENTION_DAYS = 30
 
 logger = logging.getLogger(__name__)
+
+
+def _format_wait(seconds: float) -> str:
+    if seconds >= SECONDS_PER_HOUR:
+        return f"{round(seconds / SECONDS_PER_HOUR)} hours"
+    return f"{max(1, round(seconds / SECONDS_PER_MINUTE))} minutes"
 
 
 def _prune_logs(logs_dir: str) -> None:
@@ -109,11 +115,13 @@ class Client:
 
     def _wait_before_retry(self, error: Exception, attempt: int) -> None:
         delay_seconds = min(self.config.retry_delay_seconds * 2 ** (attempt - 1), MAX_BACKOFF_SECONDS)
+        message = str(error)
         if isinstance(error, spotipy.SpotifyException) and error.http_status == HTTPStatus.TOO_MANY_REQUESTS:
-            asked_seconds = min(read_retry_after_seconds(error), MAX_RATE_LIMIT_WAIT_SECONDS)
-            delay_seconds = max(delay_seconds, asked_seconds)
+            blocked_seconds = read_retry_after_seconds(error)
+            delay_seconds = max(delay_seconds, min(blocked_seconds, MAX_RATE_LIMIT_WAIT_SECONDS))
+            message = f"too many requests, blocked for about {_format_wait(blocked_seconds)}"
         logger.info("Trying again in %ds", delay_seconds)
-        statusfile.write(self.config.state_dir, "retrying", error=str(error), retry_in_seconds=round(delay_seconds))
+        statusfile.write(self.config.state_dir, "retrying", error=message, retry_in_seconds=round(delay_seconds))
         time.sleep(delay_seconds)
 
     def read_status(self) -> dict:

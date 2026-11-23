@@ -76,6 +76,7 @@ def spotify():
 @pytest.fixture
 def session(monkeypatch, tmp_path, spotify):
     monkeypatch.setattr(session_module, "PLAYING_CHECK_INTERVAL_SECONDS", 0.01)
+    monkeypatch.setattr(session_module, "PAUSE_CONFIRM_SECONDS", 0.01)
     monkeypatch.setattr(session_module, "PAUSE_RETRY_DELAY_SECONDS", 0)
     monkeypatch.setattr(session_module, "LANDING_CHECK_DELAY_SECONDS", 0)
     monkeypatch.setattr(session_module, "LOAD_GRACE_SECONDS", 0)
@@ -343,3 +344,13 @@ def test_hand_back_says_where_playback_went(caplog, session, spotify):
     session.hand_back(Takeover(PAUSED, make_playback(FARM, is_playing=False)))
     assert "Moved your pick to Phone" in caplog.text
     assert "Moved playback to Phone" in caplog.text
+
+
+def test_a_pause_gets_its_second_look_sooner_than_a_full_check(monkeypatch, session, spotify):
+    slept = []
+    monkeypatch.setattr(session_module, "PLAYING_CHECK_INTERVAL_SECONDS", 5)
+    monkeypatch.setattr(session_module, "PAUSE_CONFIRM_SECONDS", 1)
+    monkeypatch.setattr(session_module.time, "sleep", slept.append)
+    spotify.current = make_playback(FARM, is_playing=False)
+    assert session.wait(None).reason == PAUSED
+    assert slept == [5, 1]
